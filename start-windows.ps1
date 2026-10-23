@@ -20,7 +20,7 @@ function Read-Choice([string]$Prompt, [string]$Default) {
 function Write-PrefsFile([string]$Path, [int]$App, [string]$Mode, [bool]$DryRun, [bool]$SkipSetup = $false) {
     $savedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     @(
-        "# aiproxy launcher preferences (local — not committed)"
+        "# aiproxy launcher preferences (local - not committed)"
         "APP=$App"
         "MODE=$Mode"
         "DRY_RUN=$(if ($DryRun) { 1 } else { 0 })"
@@ -54,7 +54,7 @@ function Read-PrefsFile([string]$Path) {
 
 Clear-Host
 Write-Host "========================================"
-Write-Host "  Token Saver — install & start (Windows)"
+Write-Host "  Token Saver - install & start (Windows)"
 Write-Host "========================================"
 Write-Host "Project: $Root"
 Write-Host ""
@@ -95,10 +95,10 @@ $venvDir = Join-Path $Root ".venv"
 $venvPy = Join-Path $venvDir "Scripts\python.exe"
 if (-not (Test-VenvPython $venvPy)) {
     if (Test-Path -LiteralPath $venvDir) {
-        Write-Host "Existing .venv is missing or broken — recreating …"
+        Write-Host "Existing .venv is missing or broken - recreating ..."
         Remove-Item -Recurse -Force $venvDir
     } else {
-        Write-Host "Creating virtualenv …"
+        Write-Host "Creating virtualenv ..."
     }
     Invoke-BootPython -m venv $venvDir
     $venvPy = Join-Path $venvDir "Scripts\python.exe"
@@ -111,7 +111,7 @@ if (-not (Test-VenvPython $venvPy)) {
     exit 1
 }
 
-Write-Host "Installing / updating dependencies …"
+Write-Host "Installing / updating dependencies ..."
 & $venvPy -m pip install --upgrade pip | Out-Null
 & $venvPy -m pip install -r (Join-Path $Root "requirements.txt")
 & $venvPy -m pip install -e $Root | Out-Null
@@ -123,13 +123,13 @@ $saved = Read-PrefsFile $prefPath
 
 # --- Questions (same choices as macOS / setup wizard) ---
 Write-Host "Which app are you connecting?"
-Write-Host "  1) Cursor  (default models — MITM HTTPS proxy)"
-Write-Host "  2) Claude Code  (ANTHROPIC_BASE_URL — no CA needed)"
-Write-Host "  3) Both  (MITM — Cursor + Claude via HTTPS_PROXY)"
+Write-Host "  1) Cursor  (default models - MITM HTTPS proxy)"
+Write-Host "  2) Claude Code  (ANTHROPIC_BASE_URL - no CA needed)"
+Write-Host "  3) Both  (MITM - Cursor + Claude via HTTPS_PROXY)"
 if ($saved.exists) {
     $dryLabel = if ($saved.dry_run) { "dry-run" } else { "live strip" }
     $appLabel = switch ($saved.app) { 2 { "Claude Code" } 3 { "Both" } default { "Cursor" } }
-    Write-Host "  4) Quick start  (saved: $appLabel · $dryLabel)"
+    Write-Host "  4) Quick start  (saved: $appLabel - $dryLabel)"
 }
 Write-Host ""
 $defaultApp = if ($saved.exists) { "4" } else { "1" }
@@ -150,7 +150,7 @@ if ($app -eq "4") {
     $appId = [int]$saved.app
     $mode = [string]$saved.mode
     $dryRun = [bool]$saved.dry_run
-    Write-Host "→ Quick start: app=$appId mode=$mode dry_run=$dryRun"
+    Write-Host "-> Quick start: app=$appId mode=$mode dry_run=$dryRun"
 } else {
     switch ($app) {
         "2" { $mode = "anthropic"; $appId = 2 }
@@ -159,11 +159,19 @@ if ($app -eq "4") {
     }
     $dry = Read-Choice "Dry-run first? (log savings, do not rewrite bodies) [Y/n]" "Y"
     $dryRun = ($dry -notmatch '^[nN]')
-    Write-Host $(if ($dryRun) { "→ dry-run ON" } else { "→ dry-run OFF (will strip when rules match)" })
+    Write-Host $(if ($dryRun) { "-> dry-run ON" } else { "-> dry-run OFF (will strip when rules match)" })
 }
 
-$proxyUrl = "http://127.0.0.1:8080"
-$dash = "http://127.0.0.1:8081/"
+# Ports from config.yaml, so the instructions printed below match where the
+# proxy will actually listen.
+$listenPort = 8080
+$dashPort = 8081
+try {
+    $ports = & $venvPy -c "import sys; from aiproxy.config import Config; c = Config.load(sys.argv[1]); print(c.listen_port, c.dashboard_port)" (Join-Path $Root "config.yaml")
+    if ("$ports" -match '^(\d+) (\d+)$') { $listenPort = [int]$Matches[1]; $dashPort = [int]$Matches[2] }
+} catch {}
+$proxyUrl = "http://127.0.0.1:$listenPort"
+$dash = "http://127.0.0.1:$dashPort/"
 $ca = Join-Path $env:USERPROFILE ".mitmproxy\mitmproxy-ca-cert.pem"
 $cer = Join-Path $env:USERPROFILE ".mitmproxy\mitmproxy-ca-cert.cer"
 
@@ -183,14 +191,18 @@ if (-not $quick) {
             $settings = Join-Path $claudeDir "settings.json"
             New-Item -ItemType Directory -Force -Path $claudeDir | Out-Null
             if (Test-Path $settings) {
-                Write-Host "Existing $settings — leave it unchanged and set the env var manually,"
+                Write-Host "Existing $settings - leave it unchanged and set the env var manually,"
                 Write-Host "or merge ANTHROPIC_BASE_URL under env yourself."
             } else {
-                @{
+                $json = @{
                     env = @{
                         ANTHROPIC_BASE_URL = $proxyUrl
                     }
-                } | ConvertTo-Json -Depth 5 | Set-Content -Path $settings -Encoding UTF8
+                } | ConvertTo-Json -Depth 5
+                # Windows PowerShell's "-Encoding UTF8" writes a byte-order
+                # mark, and a JSON parser that does not expect one rejects the
+                # whole file. Write plain UTF-8 instead.
+                [System.IO.File]::WriteAllText($settings, $json, (New-Object System.Text.UTF8Encoding($false)))
                 Write-Host "Wrote $settings"
             }
         }
@@ -208,12 +220,12 @@ if (-not $quick) {
   }
 "@
         Write-Host ""
-        Write-Host "Open: Ctrl+Shift+P → Open User Settings (JSON)"
+        Write-Host "Open: Ctrl+Shift+P -> Open User Settings (JSON)"
         Write-Host "File: $env:APPDATA\Cursor\User\settings.json"
         Write-Host ""
 
         if (-not (Test-Path $ca)) {
-            Write-Host "Generating mitmproxy CA …"
+            Write-Host "Generating mitmproxy CA ..."
             & $venvPy -c @"
 from pathlib import Path
 from mitmproxy.certs import CertStore
@@ -229,9 +241,9 @@ print('CA ready')
             $openPath = if (Test-Path $cer) { $cer } else { $ca }
             if (Test-Path $openPath) {
                 Start-Process $openPath
-                Write-Host "In the cert dialog: Install Certificate → Local Machine → Trusted Root Certification Authorities"
+                Write-Host "In the cert dialog: Install Certificate -> Local Machine -> Trusted Root Certification Authorities"
             } else {
-                Write-Host "CA not found at $openPath — start proxy once, then re-run."
+                Write-Host "CA not found at $openPath - start proxy once, then re-run."
             }
         }
 
@@ -249,14 +261,27 @@ print('CA ready')
         }
     }
 
+    # DoNotVerify: without it GetFolderPath returns "" when the Programs
+    # folder is missing, and Join-Path then throws at the very end of the
+    # install. No folder at all means no shortcut question.
+    $programs = [Environment]::GetFolderPath("Programs", [System.Environment+SpecialFolderOption]::DoNotVerify)
+    $startMenuLnk = if ($programs) { Join-Path $programs "Token Saver\Token Saver.lnk" } else { $null }
+    if ($startMenuLnk -and -not (Test-Path -LiteralPath $startMenuLnk)) {
+        Write-Host ""
+        $sc = Read-Choice "Add Token Saver to the Start menu and Desktop (like the Mac Dock app)? [Y/n]" "Y"
+        if ($sc -notmatch '^[nN]') {
+            & (Join-Path $Root "windows\install-shortcuts.ps1")
+        }
+    }
+
     $save = Read-Choice "Save these settings for Quick start next time? [Y/n]" "Y"
     if ($save -notmatch '^[nN]') {
         Write-PrefsFile $prefPath $appId $mode $dryRun $false
         Write-PrefsFile (Join-Path $Root ".aiproxy_session.env") $appId $mode $dryRun $false
-        Write-Host "→ saved to .aiproxy_runtime.env"
+        Write-Host "-> saved to .aiproxy_runtime.env"
     } else {
         Write-PrefsFile (Join-Path $Root ".aiproxy_session.env") $appId $mode $dryRun $false
-        Write-Host "→ session only (not saved for Quick start)"
+        Write-Host "-> session only (not saved for Quick start)"
     }
 } else {
     # Quick start: refresh session from saved
@@ -264,9 +289,10 @@ print('CA ready')
 }
 
 Write-Host "----------------------------------------"
-Write-Host "Starting aiproxy in the background (mode=$mode) …"
+Write-Host "Starting aiproxy in the background (mode=$mode) ..."
 Write-Host "Dashboard: $dash"
 Write-Host "Stop later:  powershell -ExecutionPolicy Bypass -File .\windows\stop.ps1"
+Write-Host "(or the 'Stop Token Saver' shortcut, if you added the shortcuts)"
 Write-Host "========================================"
 Write-Host ""
 
@@ -279,6 +305,6 @@ if ($exit -ne 0) {
 }
 
 Write-Host ""
-Write-Host "Proxy is running. Close this window anytime — use windows\stop.ps1 to stop."
+Write-Host "Proxy is running. Close this window anytime - use windows\stop.ps1 to stop."
 Write-Host "In the browser setup wizard, Apply & restart works the same as on macOS."
 Read-Host "Press Enter to close"

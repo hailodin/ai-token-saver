@@ -350,11 +350,15 @@ def _restart_windows(root: Path) -> tuple[bool, str]:
         f"Start-Sleep -Milliseconds 500; "
         f"& '{start}'"
     )
+    # CREATE_NO_WINDOW, not DETACHED_PROCESS: powershell.exe started without a
+    # console exits at once with code 0 and runs nothing, so "Apply & restart"
+    # reported success and the old proxy kept running. NO_WINDOW gives it a
+    # hidden console of its own.
     creationflags = 0
     if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
         creationflags |= subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-    if hasattr(subprocess, "DETACHED_PROCESS"):
-        creationflags |= subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        creationflags |= subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
     subprocess.Popen(
         [
             "powershell",

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
 from aiohttp import ClientSession, ClientTimeout, web
 
+from .claude_path import ClaudePath, Prepared, ResponseTap, is_messages_request, record_request
 from .config import Config
 from .dashboard import start_dashboard_background
 from .pricing import extract_model, set_assumed_model
@@ -19,10 +21,11 @@ log = logging.getLogger("aiproxy.bridge")
 _UPSTREAM_TIMEOUT = ClientTimeout(total=None, sock_connect=30, sock_read=None)
 
 
-def create_app(config: Config, store) -> web.Application:  # noqa: ANN001
+def create_app(config: Config, store, claude: ClaudePath | None = None) -> web.Application:  # noqa: ANN001
     app = web.Application(client_max_size=64 * 1024 * 1024)
     app["config"] = config
     app["store"] = store
+    app["claude"] = claude or ClaudePath(config)
     app.router.add_route("*", "/{path:.*}", handle)
     return app
 
@@ -77,7 +80,20 @@ async def handle(request: web.Request) -> web.StreamResponse:
     host = urlparse(upstream).hostname or "upstream"
     req_path = "/" + path if path else "/"
 
-    if request.method.upper() in {"POST", "PUT", "PATCH"} and body:
+    to_anthropic = upstream == config.anthropic_upstream.rstrip("/")
+    claude: ClaudePath = request.app["claude"]
+    prep: Prepared | None = None
+
+    if to_anthropic and is_messages_request(request.method, req_path) and body:
+        # Claude Code: never the strip rules below (see claude_path.py).
+        raw = body
+        body, prep = claude.prepare(raw, dry_run=config.strip.dry_run)
+        record_request(store, host, req_path, raw, body, prep, extract_model(raw, None))
+    elif to_anthropic:
+        # count_tokens and the rest: forwarded as sent. Stripping a
+        # count_tokens body made it count a different conversation.
+        pass
+    elif request.method.upper() in {"POST", "PUT", "PATCH"} and body:
         new_body, result = try_strip_bytes(body, config.strip)
         if result is not None:
             before = body.decode("utf-8", errors="ignore")
@@ -149,10 +165,40 @@ async def handle(request: web.Request) -> web.StreamResponse:
             }
             response = web.StreamResponse(status=resp.status, headers=out_headers)
             await response.prepare(request)
-            async for chunk in resp.content.iter_any():
-                await response.write(chunk)
-            await response.write_eof()
+            tap = ResponseTap() if prep is not None else None
+            try:
+                async for chunk in resp.content.iter_any():
+                    if tap is not None:
+                        tap.feed(chunk)
+                    await response.write(chunk)
+                await response.write_eof()
+            finally:
+                # Booked even when the client hung up mid-stream: the tokens
+                # were billed either way.
+                if prep is not None and tap is not None:
+                    try:
+                        claude.finish(
+                            prep,
+                            path=req_path,
+                            status=resp.status,
+                            content_type=resp.headers.get("content-type", ""),
+                            response=tap.data(),
+                        )
+                    except Exception:  # noqa: BLE001 - accounting must not break a reply
+                        log.exception("claude accounting failed")
             return response
+
+
+def env_line(name: str, value: str) -> str:
+    """How to set an environment variable in this platform's usual shell.
+
+    The banner used to print `export ...` everywhere; pasted into PowerShell
+    or cmd.exe that is an error, and it is the first thing a Windows user
+    copies.
+    """
+    if sys.platform == "win32":
+        return f'$env:{name} = "{value}"'
+    return f'export {name}="{value}"'
 
 
 def _banner(config: Config) -> str:
@@ -171,7 +217,7 @@ def _banner(config: Config) -> str:
             f"  dry-run    {dry}\n"
             f"\n"
             f"Claude Code:\n"
-            f"  export ANTHROPIC_BASE_URL=\"{base}\"\n"
+            f"  {env_line('ANTHROPIC_BASE_URL', base)}\n"
             f"  claude\n"
             f"  /status   # confirm base URL\n"
         )
@@ -195,7 +241,7 @@ def _banner(config: Config) -> str:
         f"  dashboard  {dash_v2}\n"
         f"  dry-run    {dry}\n"
         f"\n"
-        f"Claude Code:  export ANTHROPIC_BASE_URL=\"{base}\" && claude\n"
+        f"Claude Code:  {env_line('ANTHROPIC_BASE_URL', base)}  then  claude\n"
         f"Cursor BYOK:  OpenAI Base URL → {base}/v1\n"
     )
 

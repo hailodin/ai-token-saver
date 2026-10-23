@@ -103,7 +103,13 @@ def _content_to_text(content: Any) -> str:
 def _set_content(msg: dict[str, Any], text: str) -> None:
     content = msg.get("content")
     if isinstance(content, list) and content:
-        # Keep structure; rewrite first text-like part, drop the rest if huge
+        # Keep the structure: rewrite the first text-like part and keep every
+        # other part exactly as it was. The previous version appended only the
+        # rewritten part and silently dropped the rest, so a user message that
+        # carried two tool_result blocks (Claude Code sends these) left here
+        # with none - and the API answered 400 "tool_use ids were found
+        # without tool_result blocks". A rewrite must never change the block
+        # count of a message.
         rewritten = False
         new_parts: list[Any] = []
         for p in content:
@@ -117,10 +123,13 @@ def _set_content(msg: dict[str, Any], text: str) -> None:
             elif not rewritten and isinstance(p, str):
                 new_parts.append(text)
                 rewritten = True
+            else:
+                new_parts.append(p)
         if not rewritten:
-            msg["content"] = text
-        else:
-            msg["content"] = new_parts
+            # No text part to carry the rewrite: leave the message alone rather
+            # than replace tool_result / image blocks with a string.
+            return
+        msg["content"] = new_parts
     else:
         msg["content"] = text
 

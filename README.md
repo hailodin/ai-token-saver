@@ -35,8 +35,9 @@ Local proxy between **Cursor** / **Claude Code** and the model APIs. It strips b
 ### Windows
 
 1. Double-click **`start-windows.bat`** — installs deps, asks Cursor / Claude / Both / Quick start (same as macOS), saves prefs, starts the proxy in the background, opens the dashboard.
-2. Stop with `powershell -ExecutionPolicy Bypass -File .\windows\stop.ps1`.
-3. Full Windows notes (CA trust, PowerShell paths): [README-Windows.md](README-Windows.md)
+2. Say yes to the shortcuts question (or run `windows\install-shortcuts.ps1`) to get **Token Saver** / **Stop Token Saver** in the Start menu and on the Desktop — the Windows version of the Dock app.
+3. Stop with the shortcut or `powershell -ExecutionPolicy Bypass -File .\windows\stop.ps1`.
+4. Full Windows notes (shortcuts, ports, CA trust, what happens to Claude Code traffic): [README-Windows.md](README-Windows.md)
 
 > Always run the proxy with the **venv Python** (`.venv/bin/python` on Mac, `.venv\Scripts\python.exe` on Windows) — not system `python`.
 

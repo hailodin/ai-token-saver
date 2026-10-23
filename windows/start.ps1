@@ -3,7 +3,9 @@
 # - Reads .aiproxy_session.env / .aiproxy_runtime.env
 # - Opens dashboard (?setup=1 unless SKIP_SETUP=1)
 param(
-    [switch]$NoBrowser
+    [switch]$NoBrowser,
+    # Set by the Start menu / Desktop shortcut (windows\install-shortcuts.ps1).
+    [switch]$FromShortcut
 )
 
 $ErrorActionPreference = "Stop"
@@ -14,19 +16,42 @@ $LogDir = Join-Path $Support "logs"
 $PidFile = Join-Path $Support "proxy.pid"
 New-Item -ItemType Directory -Force -Path $Support, $LogDir | Out-Null
 
-if (-not (Test-Path -LiteralPath (Join-Path $Root "config.yaml"))) {
-    Write-Error "config.yaml not found at $Root"
+# A shortcut runs this in a hidden window, where a printed error is never
+# seen: the click would simply do nothing. So a failure there is a message box.
+function Stop-WithError([string]$Message) {
+    Write-Host $Message
+    if ($FromShortcut) {
+        try { (New-Object -ComObject WScript.Shell).Popup($Message, 0, "Token Saver", 16) | Out-Null } catch {}
+    }
     exit 1
+}
+
+if (-not (Test-Path -LiteralPath (Join-Path $Root "config.yaml"))) {
+    Stop-WithError "config.yaml not found at $Root"
 }
 
 Set-Location $Root
 
-$DirectUrl = "http://127.0.0.1:8081/"
-$SetupUrl = "http://127.0.0.1:8081/?setup=1"
+$VenvPy = Join-Path $Root ".venv\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $VenvPy)) {
+    Stop-WithError "Token Saver is not installed yet. Double-click start-windows.bat in $Root once to install it."
+}
+
+# Ports come from config.yaml. They used to be fixed at 8080/8081 here, so
+# moving the proxy off a busy port (as the README suggests) made this script
+# wait on the wrong port, report failure and leave the proxy running.
+$DashPort = 8081
+try {
+    $ports = & $VenvPy -c "import sys; from aiproxy.config import Config; c = Config.load(sys.argv[1]); print(c.listen_port, c.dashboard_port)" (Join-Path $Root "config.yaml")
+    if ("$ports" -match '^(\d+) (\d+)$') { $DashPort = [int]$Matches[2] }
+} catch {}
+
+$DirectUrl = "http://127.0.0.1:$DashPort/"
+$SetupUrl = "http://127.0.0.1:$DashPort/?setup=1"
 
 function Test-Dashboard {
     try {
-        $r = Invoke-WebRequest -Uri "http://127.0.0.1:8081/api/stats" -UseBasicParsing -TimeoutSec 1
+        $r = Invoke-WebRequest -Uri "http://127.0.0.1:$DashPort/api/stats" -UseBasicParsing -TimeoutSec 1
         return $r.StatusCode -eq 200
     } catch {
         return $false
@@ -38,17 +63,11 @@ function Open-Dashboard([string]$Url) {
     try { Start-Process $Url } catch {}
 }
 
-# Healthy already — focus dashboard, do not restart.
+# Healthy already - focus dashboard, do not restart.
 if (Test-Dashboard) {
     Open-Dashboard $DirectUrl
-    Write-Host "Proxy already running — opened dashboard."
+    Write-Host "Proxy already running - opened dashboard."
     exit 0
-}
-
-$VenvPy = Join-Path $Root ".venv\Scripts\python.exe"
-if (-not (Test-Path -LiteralPath $VenvPy)) {
-    Write-Error "Python venv missing. Run start-windows.bat once to install dependencies."
-    exit 1
 }
 
 # Stale PID only if dashboard is down.
@@ -108,7 +127,10 @@ $errLog = Join-Path $LogDir "proxy.err.log"
 $stamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 Add-Content -LiteralPath (Join-Path $LogDir "starts.log") -Value "---- $stamp start mode=$Mode dry_run=$DryRun root=$Root ----"
 
-$argList = @("-m", "aiproxy", "--mode", $Mode, "-c", (Join-Path $Root "config.yaml"))
+# Start-Process joins -ArgumentList with spaces and quotes nothing, so a
+# project folder with a space in its name ("Token Saver") split the config
+# path into two arguments. Quote it here.
+$argList = @("-m", "aiproxy", "--mode", $Mode, "-c", "`"$(Join-Path $Root 'config.yaml')`"")
 if ($DryRun -eq "1") { $argList += "--dry-run" }
 
 $proc = Start-Process -FilePath $VenvPy -ArgumentList $argList `
@@ -122,16 +144,22 @@ $proc.Id | Set-Content -LiteralPath $PidFile -Encoding ASCII
 Set-Content -LiteralPath (Join-Path $Support "project_root") -Value $Root -Encoding UTF8
 Set-Content -LiteralPath (Join-Path $Support "last_pid") -Value $proc.Id -Encoding ASCII
 
+# Up to 30 s. Measured on a fresh install (Windows 11, Python 3.14): the
+# dashboard answers 1 s after launch in anthropic mode and 2.5 s in mitm
+# mode; the margin is for slower disks and a Defender scan of the new venv.
 $ok = $false
-for ($i = 0; $i -lt 15; $i++) {
-    Start-Sleep -Milliseconds 400
+for ($i = 0; $i -lt 60; $i++) {
+    Start-Sleep -Milliseconds 500
     if ($proc.HasExited) { break }
     if (Test-Dashboard) { $ok = $true; break }
 }
 
 if (-not $ok) {
-    Write-Error "Token Saver started but dashboard is not responding on :8081. See log: $Log"
-    exit 1
+    $why = if ($proc.HasExited) { "The proxy exited." } else { "The proxy is running but not answering." }
+    # Python writes the log as UTF-8; read it the same way, or a dash in a
+    # log line shows up as mojibake in the message box.
+    $tail = (Get-Content -LiteralPath $errLog -Tail 12 -Encoding UTF8 -ErrorAction SilentlyContinue) -join "`n"
+    Stop-WithError "Token Saver did not come up: the dashboard is not answering on port $DashPort. $why`n`nLast lines of $errLog`:`n$tail"
 }
 
 if ($SkipSetup -eq "1") {

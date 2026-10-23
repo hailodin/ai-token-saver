@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from pathlib import Path
 
 from mitmproxy import ctx, http
 
+from .claude_path import ANTHROPIC_HOST, ClaudePath, ResponseTap, is_messages_request, record_request
 from .config import Config, host_matches
 from .connect_strip import (
     path_is_noise,
@@ -19,6 +21,24 @@ from .stats import StatsStore, get_store, resolve_stats_path
 from .stripper import estimate_tokens, try_strip_bytes
 
 log = logging.getLogger("aiproxy.addon")
+
+_UNSAFE_NAME = re.compile(r"[^A-Za-z0-9_-]+")
+# flow.metadata key: (Prepared, ResponseTap) for a Claude Code request.
+_CLAUDE_META = "aiproxy_claude"
+
+
+def _dump_stem(ts: int, *parts: str) -> str:
+    """File-name stem for a body dump, built from the request's host and path.
+
+    Windows refuses ? : * " < > | in file names, and Claude Code posts to
+    /v1/messages?beta=true, so every dump of a Claude request raised OSError
+    there. Dots go too: the old name ended in the host's ".com_..." part,
+    which with_suffix() treated as an extension and replaced, so the
+    .meta.json was named after the host instead of the request.
+    """
+    raw = "_".join(p for p in parts if p)
+    safe = _UNSAFE_NAME.sub("_", raw).strip("_")[:100]
+    return f"{ts}_{safe}"
 
 
 def _should_block(host: str, config: Config) -> bool:
@@ -63,6 +83,7 @@ class CursorStripAddon:
         self.store = store or get_store(resolve_stats_path(config.stats_path))
         self.dump_dir = Path(config.logging.dump_dir)
         self.dump_dir.mkdir(parents=True, exist_ok=True)
+        self.claude = ClaudePath(config)
 
     def load(self, loader) -> None:  # noqa: ANN001
         ctx.log.info(
@@ -92,12 +113,40 @@ class CursorStripAddon:
         host = flow.request.pretty_host or ""
         ct = flow.response.headers.get("content-type") or ""
         te = (flow.response.headers.get("transfer-encoding") or "").lower()
+        claude = flow.metadata.get(_CLAUDE_META)
+        if claude is not None:
+            # Stream it as before, but keep a copy of the ends to read usage.
+            tap = claude[1]
+
+            def tee(chunk: bytes) -> bytes:
+                tap.feed(chunk)
+                return chunk
+
+            flow.response.stream = tee
+            return
         if (
             _is_streaming_content_type(ct)
             or "chunked" in te
             or host_matches(host, self.config.intercept_hosts)
         ):
             flow.response.stream = True
+
+    def response(self, flow: http.HTTPFlow) -> None:
+        claude = flow.metadata.pop(_CLAUDE_META, None)
+        if claude is None or flow.response is None:
+            return
+        prep, tap = claude
+        try:
+            self.claude.finish(
+                prep,
+                path=flow.request.path or "",
+                status=flow.response.status_code,
+                content_type=flow.response.headers.get("content-type") or "",
+                # Streamed: the tap holds it. Buffered (small replies): the body.
+                response=tap.data() or (flow.response.raw_content or b""),
+            )
+        except Exception as e:  # noqa: BLE001 - accounting must not break a reply
+            ctx.log.warn(f"claude accounting failed: {e}")
 
     def tls_failed_client(self, data) -> None:  # noqa: ANN001
         ctx.log.warn(
@@ -174,6 +223,21 @@ class CursorStripAddon:
                 f"passthrough empty/missing body {host}{path} "
                 f"ct={content_type or '-'} content-length={cl}"
             )
+            return
+
+        # --- Claude Code (via HTTPS_PROXY): never the strip rules below ---
+        if host.lower() == ANTHROPIC_HOST:
+            if not is_messages_request(flow.request.method, path):
+                # count_tokens and the rest go as sent.
+                return
+            sent, prep = self.claude.prepare(raw, dry_run=self.config.strip.dry_run)
+            if sent is not raw:
+                flow.request.raw_content = sent
+                flow.request.headers["content-length"] = str(len(sent))
+                if "transfer-encoding" in flow.request.headers:
+                    del flow.request.headers["transfer-encoding"]
+            record_request(self.store, host, path, raw, sent, prep, extract_model(raw))
+            flow.metadata[_CLAUDE_META] = (prep, ResponseTap())
             return
 
         # --- Cursor Connect / protobuf ---
@@ -407,9 +471,7 @@ class CursorStripAddon:
 
     def _dump_raw_sample(self, host: str, path: str, raw: bytes, content_type: str) -> None:
         try:
-            ts = int(time.time() * 1000)
-            safe = path.replace("/", "_")[:80]
-            base = self.dump_dir / f"{ts}_noop{safe}"
+            stem = _dump_stem(int(time.time() * 1000), "noop", path)
             meta = {
                 "host": host,
                 "path": path,
@@ -418,11 +480,11 @@ class CursorStripAddon:
                 "head_hex": raw[:64].hex(),
                 "ascii_sample": raw[:400].decode("utf-8", errors="replace"),
             }
-            base.with_suffix(".meta.json").write_text(
+            (self.dump_dir / f"{stem}.meta.json").write_text(
                 json.dumps(meta, indent=2), encoding="utf-8"
             )
-            base.with_suffix(".bin").write_bytes(raw)
-            ctx.log.info(f"wrote noop sample {base.name}.bin ({len(raw)} bytes)")
+            (self.dump_dir / f"{stem}.bin").write_bytes(raw)
+            ctx.log.info(f"wrote noop sample {stem}.bin ({len(raw)} bytes)")
         except OSError as e:
             ctx.log.warn(f"noop dump failed: {e}")
 
@@ -437,10 +499,7 @@ class CursorStripAddon:
             return
         if lc.dump_only_when_stripped and not result.changed:
             return
-        ts = int(time.time() * 1000)
-        safe_host = host.replace("/", "_")
-        safe_path = path.replace("/", "_")[:80]
-        base = self.dump_dir / f"{ts}_{safe_host}{safe_path}"
+        stem = _dump_stem(int(time.time() * 1000), host, path)
         meta = {
             "host": host,
             "path": path,
@@ -453,17 +512,19 @@ class CursorStripAddon:
             "notes": result.notes,
             "dry_run": self.config.strip.dry_run,
         }
-        base.with_suffix(".meta.json").write_text(
-            json.dumps(meta, indent=2), encoding="utf-8"
-        )
+        # A failed dump must never fail the request it describes: this runs
+        # inside mitmproxy's request hook, after the body was already replaced.
         try:
-            base.with_name(base.name + ".before.json").write_text(
+            (self.dump_dir / f"{stem}.meta.json").write_text(
+                json.dumps(meta, indent=2), encoding="utf-8"
+            )
+            (self.dump_dir / f"{stem}.before.json").write_text(
                 json.dumps(_redact(result.original), indent=2, ensure_ascii=False)[
                     :500_000
                 ],
                 encoding="utf-8",
             )
-            base.with_name(base.name + ".after.json").write_text(
+            (self.dump_dir / f"{stem}.after.json").write_text(
                 json.dumps(_redact(result.stripped), indent=2, ensure_ascii=False)[
                     :500_000
                 ],
@@ -471,6 +532,8 @@ class CursorStripAddon:
             )
         except (TypeError, ValueError):
             pass
+        except OSError as e:
+            ctx.log.warn(f"body dump failed: {e}")
 
 
 def looks_like_text(raw: bytes) -> bool:

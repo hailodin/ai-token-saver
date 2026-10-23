@@ -245,8 +245,13 @@ def _run_mitm(config) -> int:  # noqa: ANN001
     ]
     from .config import dashboard_direct_origin, dashboard_origin
     from .local_hostname import hostname_configured
+    from .openai_bridge import env_line
 
     ca = Path.home() / ".mitmproxy" / "mitmproxy-ca-cert.pem"
+    if sys.platform == "win32":
+        launch_cursor = 'Start-Process "$env:LOCALAPPDATA\\Programs\\cursor\\Cursor.exe"'
+    else:
+        launch_cursor = "open -a Cursor"
     dash = dashboard_origin(config)
     direct = dashboard_direct_origin(config)
     alias = (config.dashboard_hostname or "").strip()
@@ -273,8 +278,8 @@ def _run_mitm(config) -> int:  # noqa: ANN001
         f'  "cursor.general.disableHttp2": true\n'
         f"\n"
         f"Relaunch Cursor with:\n"
-        f'  export NODE_EXTRA_CA_CERTS="{ca}"\n'
-        f"  open -a Cursor\n"
+        f"  {env_line('NODE_EXTRA_CA_CERTS', str(ca))}\n"
+        f"  {launch_cursor}\n"
         f"\n"
         f"Streaming SSE/Connect responses are forwarded immediately "
         f"(fixes 'sent but no reply').\n",

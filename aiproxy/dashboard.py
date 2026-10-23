@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from aiohttp import web
 
+from .claude_stats import get_claude_store
 from .stats import StatsStore
 from .dashboard_v2 import HTML_HEAD as DASHBOARD_HTML_V2_HEAD
 from .setup_modal import SETUP_MODAL_ASSETS
@@ -564,6 +565,37 @@ DASHBOARD_HTML_HEAD = r"""<!DOCTYPE html>
         <div class="sub" id="life-volume-sub">0 tok requested · 0 stripped</div>
       </div>
     </section>
+
+    <div id="claude-block" hidden>
+    <p class="section-label">Claude Code · Anthropic's own usage numbers, at list prices · all time</p>
+    <section class="lifetime" aria-label="Claude Code">
+      <div class="panel stat">
+        <label>Claude Code spent</label>
+        <div class="v in" id="cc-spent">$0</div>
+        <div class="sub" id="cc-spent-sub">list price</div>
+      </div>
+      <div class="panel stat">
+        <label>Requests</label>
+        <div class="v in" id="cc-requests">0</div>
+        <div class="sub" id="cc-requests-sub">0 errors</div>
+      </div>
+      <div class="panel stat">
+        <label>Read back from cache</label>
+        <div class="v pct" id="cc-cache">0%</div>
+        <div class="sub" id="cc-cache-sub">of prompt tokens</div>
+      </div>
+      <div class="panel stat">
+        <label>Duplicates removed</label>
+        <div class="v saved" id="cc-saved">$0</div>
+        <div class="sub" id="cc-saved-sub">estimate</div>
+      </div>
+      <div class="panel stat">
+        <label>Cache misses</label>
+        <div class="v out" id="cc-misses">0</div>
+        <div class="sub">a conversation sent again in full</div>
+      </div>
+    </section>
+    </div>
 
     <p class="section-label">Window · filtered by toolbar</p>
     <section class="hero">
@@ -1193,6 +1225,30 @@ function applyView(d) {
 
 function round2(n) { return Math.round(n * 100) / 100; }
 
+// Claude Code is measured from the API's usage numbers (cache reads, cache
+// writes, output), not estimated from characters like the rest of the page:
+// most of a Claude Code prompt is a cache read at a tenth of the input price
+// or less, so a character-based figure overstates it many times over.
+function renderClaude(c) {
+  const block = document.getElementById("claude-block");
+  if (!block) return;
+  const t = c && c.totals;
+  if (!t || !Number(t.requests)) { block.hidden = true; return; }
+  block.hidden = false;
+  const prompt = Number(c.prompt_tokens || 0);
+  setText("cc-spent", fmtUsd(t.cost_usd));
+  setText("cc-spent-sub", fmt(prompt) + " prompt tok · " + fmt(t.output_tokens) + " out"
+    + (Number(t.unpriced) ? " · " + t.unpriced + " unpriced" : ""));
+  setText("cc-requests", fmtFull(t.requests));
+  setText("cc-requests-sub", fmtFull(t.errors) + " errors");
+  setText("cc-cache", (c.cache_hit_pct || 0) + "%");
+  setText("cc-cache-sub", fmt(t.cache_read) + " of " + fmt(prompt) + " prompt tok");
+  setText("cc-saved", fmtUsd(t.saved_usd_est));
+  setText("cc-saved-sub", "estimate · " + fmtFull(t.stubs_new) + " duplicate tool results · ~"
+    + fmt(t.removed_tokens_est) + " tok");
+  setText("cc-misses", fmtFull(t.cache_misses));
+}
+
 function bindSeg(id, attr, onPick) {
   const root = document.getElementById(id);
   root.querySelectorAll("button").forEach(btn => {
@@ -1220,6 +1276,7 @@ async function refresh() {
     if (!res.ok) throw new Error("stats " + res.status);
     lastPayload = await res.json();
     applyView(lastPayload);
+    renderClaude(lastPayload.claude);
   } catch (e) {
     console.error(e);
     document.getElementById("meta").textContent = "dashboard offline";
@@ -1292,10 +1349,20 @@ def create_dashboard_app(store: StatsStore, config: "Config | None" = None) -> w
         return web.Response(text=DASHBOARD_HTML_V2, content_type="text/html")
 
     async def api_stats(request: web.Request) -> web.Response:
-        return web.json_response(request.app["store"].snapshot())
+        payload = request.app["store"].snapshot()
+        claude = get_claude_store()
+        if claude is not None:
+            snap = claude.snapshot()
+            payload["claude"] = {
+                k: snap[k] for k in ("totals", "prompt_tokens", "cache_hit_pct", "by_model")
+            }
+        return web.json_response(payload)
 
     async def api_reset(request: web.Request) -> web.Response:
         request.app["store"].reset()
+        claude = get_claude_store()
+        if claude is not None:
+            claude.reset()
         return web.json_response({"ok": True})
 
     async def api_setup(request: web.Request) -> web.Response:

@@ -6,6 +6,8 @@ from typing import Any
 
 import yaml
 
+from .claude_strip import ClaudeConfig
+
 
 @dataclass
 class StripConfig:
@@ -60,19 +62,27 @@ class Config:
     logging: LogConfig = field(default_factory=LogConfig)
     pricing: PricingConfig = field(default_factory=PricingConfig)
     stats_path: str = "logs/stats.json"
+    # Claude Code's own path (claude_path.py): never the strip rules above.
+    claude: ClaudeConfig = field(default_factory=ClaudeConfig)
 
     @classmethod
     def load(cls, path: str | Path) -> "Config":
         path = Path(path)
         raw: dict[str, Any] = {}
         if path.exists():
-            with path.open() as f:
+            # Explicit UTF-8: Windows' default is cp1252, which turns the em
+            # dashes in this file's comments into mojibake and raises on any
+            # character cp1252 has no byte for. "-sig" also accepts the BOM
+            # older Notepad versions add when saving.
+            with path.open(encoding="utf-8-sig") as f:
                 raw = yaml.safe_load(f) or {}
 
         strip_raw = raw.get("strip") or {}
         log_raw = raw.get("logging") or {}
         pricing_raw = raw.get("pricing") or {}
+        claude_raw = raw.get("claude") or {}
         base = path.parent if path.exists() else Path(__file__).resolve().parent.parent
+        claude_defaults = ClaudeConfig()
 
         return cls(
             listen_host=raw.get("listen_host", "127.0.0.1"),
@@ -125,6 +135,21 @@ class Config:
                 str(raw.get("stats_path", "logs/stats.json")),
                 base=base,
             ),
+            claude=ClaudeConfig(
+                enabled=bool(claude_raw.get("enabled", claude_defaults.enabled)),
+                dedupe_tool_results=bool(
+                    claude_raw.get("dedupe_tool_results", claude_defaults.dedupe_tool_results)
+                ),
+                dedupe_min_chars=int(
+                    claude_raw.get("dedupe_min_chars", claude_defaults.dedupe_min_chars)
+                ),
+                state_path=_resolve_stats_path(
+                    str(claude_raw.get("state_path", claude_defaults.state_path)), base=base
+                ),
+                stats_path=_resolve_stats_path(
+                    str(claude_raw.get("stats_path", claude_defaults.stats_path)), base=base
+                ),
+            ),
         )
 
 
@@ -141,11 +166,25 @@ def dashboard_bind_host(config: Config) -> str:
     return config.listen_host
 
 
-def dashboard_public_host(config: Config) -> str:
-    """Hostname shown in URLs / banners (alias or loopback)."""
+def _alias_installed(config: Config) -> bool:
+    """True once --install-hostname has put the alias in the hosts file.
+
+    The alias is set in config.yaml by default, but it only resolves after the
+    one-time admin install. Advertising it before then sent every new user to
+    a page that does not load.
+    """
     alias = (config.dashboard_hostname or "").strip()
-    if alias:
-        return alias
+    if not alias:
+        return False
+    from .local_hostname import hostname_configured
+
+    return hostname_configured(alias, alias_ip=config.dashboard_alias_ip)
+
+
+def dashboard_public_host(config: Config) -> str:
+    """Hostname shown in URLs / banners (alias once installed, else loopback)."""
+    if _alias_installed(config):
+        return (config.dashboard_hostname or "").strip()
     host = config.listen_host
     if host in ("0.0.0.0", "::", "[::]"):
         return "127.0.0.1"
@@ -153,8 +192,8 @@ def dashboard_public_host(config: Config) -> str:
 
 
 def dashboard_public_port(config: Config) -> int:
-    """Port shown in public URLs (80 via alias when hostname is set)."""
-    if (config.dashboard_hostname or "").strip():
+    """Port shown in public URLs (80 via alias once installed)."""
+    if _alias_installed(config):
         return int(config.dashboard_alias_port or 80)
     return int(config.dashboard_port)
 

@@ -6,6 +6,8 @@ listen_port: 8080
 dashboard_port: 8081
 # Friendly local URL: http://tokensaver.local/  (no port)
 # One-time: sudo "$(pwd)/.venv/bin/python" -m aiproxy --install-hostname
+#   Windows (Administrator PowerShell, in this folder):
+#   & "$(Get-Location)\.venv\Scripts\python.exe" -m aiproxy --install-hostname
 #   → hosts: 127.0.0.2 tokensaver.local
 #   → privileged alias service reads dashboard_port from this file
 #     (change the port anytime — no need to reinstall the hostname)
@@ -102,6 +104,21 @@ strip:
   # Dry-run: log savings but forward the original body.
   # Live rewrite is on; a safety gate skips applies that would drop >50% of chars.
   dry_run: false
+
+# Claude Code (requests to Anthropic's /v1/messages) never goes through the
+# strip rules above: dropping old messages, shortening the system prompt or
+# removing thinking blocks breaks its prompt cache, so every request would be
+# billed as new, and current models can refuse an edited history. See
+# CLAUDE-CODE-NOTES.md. What it gets instead is lossless: a tool result in the
+# newest message that is byte-identical to an earlier one becomes a short
+# pointer to that copy. The dashboard's "Claude Code" row shows real spend
+# from Anthropic's own usage numbers. Dry-run applies here too.
+claude:
+  enabled: true              # false = forward Claude Code untouched (still measured)
+  dedupe_tool_results: true
+  dedupe_min_chars: 300      # a pointer is ~150 chars; smaller results are left alone
+  state_path: "logs/claude_state.json"   # every pointer ever sent, replayed identically
+  stats_path: "logs/claude_stats.json"
 
 logging:
   level: INFO
