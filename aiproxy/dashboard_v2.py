@@ -623,6 +623,56 @@ HTML_HEAD = r"""<!DOCTYPE html>
       </div>
     </section>
 
+    <!-- The same Claude Code section as the main page, with the same element
+         ids: renderClaude() in the shared script fills whichever page has
+         them. Until 23 Oct 2026 only the main page did, and the ops board
+         showed no Claude Code figures at all. -->
+    <div id="claude-block" hidden>
+    <p class="section-label">Claude Code · Anthropic's own usage numbers, at list prices · all time</p>
+    <section class="metrics" aria-label="Claude Code">
+      <div class="stat">
+        <label>Claude Code spent</label>
+        <div class="v in" id="cc-spent">$0</div>
+        <div class="sub" id="cc-spent-sub">list price</div>
+      </div>
+      <div class="stat">
+        <label>Requests</label>
+        <div class="v in" id="cc-requests">0</div>
+        <div class="sub" id="cc-requests-sub">0 errors</div>
+      </div>
+      <div class="stat alt">
+        <label>Read back from cache</label>
+        <div class="v pct" id="cc-cache">0%</div>
+        <div class="sub" id="cc-cache-sub">of prompt tokens</div>
+      </div>
+      <div class="stat mint">
+        <label>Duplicates removed</label>
+        <div class="v saved" id="cc-saved">$0</div>
+        <div class="sub" id="cc-saved-sub">estimate</div>
+      </div>
+      <div class="stat mint">
+        <label>Tool definitions left out</label>
+        <div class="v saved" id="cc-tools">$0</div>
+        <div class="sub" id="cc-tools-sub">none · set claude.drop_tool_prefixes</div>
+      </div>
+      <div class="stat mint">
+        <label>Kept warm</label>
+        <div class="v saved" id="cc-warm">$0</div>
+        <div class="sub" id="cc-warm-sub">off · claude.keep_cache_warm</div>
+      </div>
+      <div class="stat warm">
+        <label>Cache misses</label>
+        <div class="v out" id="cc-misses">0</div>
+        <div class="sub">a conversation sent again in full</div>
+      </div>
+    </section>
+    <section class="panel" aria-label="Tools sent on every turn" id="cc-tools-panel" hidden style="margin-bottom:12px">
+      <div class="head"><h2>Tools sent on every turn</h2>
+        <span class="hint" id="cc-tools-hint">which tool definitions ride on every request, and how often each is called</span></div>
+      <div class="table-scroll" id="cc-tools-table"></div>
+    </section>
+    </div>
+
     <p class="section-label">Window · filtered by toolbar</p>
     <section class="featured" aria-label="Primary KPIs">
       <div class="feat">
