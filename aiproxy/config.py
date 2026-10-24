@@ -149,6 +149,17 @@ class Config:
                 stats_path=_resolve_stats_path(
                     str(claude_raw.get("stats_path", claude_defaults.stats_path)), base=base
                 ),
+                drop_tool_prefixes=[
+                    str(p).strip() for p in (claude_raw.get("drop_tool_prefixes") or []) if str(p).strip()
+                ],
+                keep_cache_warm=bool(claude_raw.get("keep_cache_warm", claude_defaults.keep_cache_warm)),
+                # Capped below 3600 so the refresh always lands inside the
+                # hour, however long the last reply took to stream.
+                keep_warm_after_seconds=min(3540, max(60, int(
+                    claude_raw.get("keep_warm_after_seconds", claude_defaults.keep_warm_after_seconds)))),
+                keep_warm_limit=max(0, int(claude_raw.get("keep_warm_limit", claude_defaults.keep_warm_limit))),
+                keep_warm_min_requests=max(1, int(
+                    claude_raw.get("keep_warm_min_requests", claude_defaults.keep_warm_min_requests))),
             ),
         )
 

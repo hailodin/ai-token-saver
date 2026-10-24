@@ -12,14 +12,16 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+import time
 from pathlib import Path
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from aiproxy.claude_path import ClaudePath, ResponseTap, is_messages_request
+from aiproxy.claude_path import ClaudePath, KeepWarm, ResponseTap, is_messages_request
+from aiproxy.claude_stats import ClaudeStats, ConvState
 from aiproxy.claude_strip import STUB_TEXT, conversation_key
-from aiproxy.claude_usage import parse_sse
+from aiproxy.claude_usage import Usage, parse_json, parse_sse
 from aiproxy.config import Config
 from aiproxy.stats import StatsStore
 from aiproxy.stripper import try_strip_bytes
@@ -117,24 +119,45 @@ class Upstream:
         return app
 
 
-async def _with_bridge(fn) -> None:  # noqa: ANN001
+async def _with_bridge(fn, tune=None) -> None:  # noqa: ANN001
     from aiproxy.openai_bridge import create_app
 
     up = Upstream()
     async with TestServer(up.app()) as upstream_srv:
         with tempfile.TemporaryDirectory() as tmp:
             cfg = _config(Path(tmp), upstream=str(upstream_srv.make_url("")).rstrip("/"))
+            if tune is not None:
+                tune(cfg)
             claude = ClaudePath(cfg)
             proxy = create_app(cfg, StatsStore(persist_path=None), claude)
             async with TestClient(TestServer(proxy)) as client:
                 await fn(client, up, claude)
+            # Whatever the keep-warm holds must never have reached a file:
+            # the stored request carries the user's API key.
+            on_disk = "".join(f.read_text(encoding="utf-8", errors="replace")
+                              for f in Path(tmp).rglob("*") if f.is_file())
+            assert "test-not-a-key" not in on_disk and "x-api-key" not in on_disk, "a header reached the disk"
 
 
 async def _post(client: TestClient, path: str, body: dict) -> bytes:
     r = await client.post(path, data=json.dumps(body).encode(),
-                          headers={"content-type": "application/json", "anthropic-version": "2023-06-01"})
+                          headers={"content-type": "application/json", "anthropic-version": "2023-06-01",
+                                   "x-api-key": "test-not-a-key"})
     assert r.status == 200, r.status
     return await r.read()
+
+
+def _tools_body(turn: int = 1) -> dict:
+    """A short conversation with a tool set: two built-ins and two from a
+    connector family the user does not use in a terminal."""
+    body = _claude_code_body(turn)
+    body["tools"] = [
+        {"name": "Read", "description": "read a file", "input_schema": {"type": "object"}},
+        {"name": "Bash", "description": "run a command", "input_schema": {"type": "object"}},
+        {"name": "mcp__Google_Drive__search", "description": "d" * 2000, "input_schema": {"type": "object"}},
+        {"name": "mcp__Google_Drive__read", "description": "r" * 900, "input_schema": {"type": "object"}},
+    ]
+    return body
 
 
 # --- tests -------------------------------------------------------------------
@@ -279,6 +302,148 @@ def test_mitm_addon_claude_flow() -> None:
         assert t["requests"] == 1 and t["output_tokens"] == 50 and t["cache_write_1h"] == 1_000
 
 
+def test_bridge_leaves_out_tool_families_on_every_request() -> None:
+    """drop_tool_prefixes: the named families are gone from EVERY request of
+    the conversation (the set is part of the cached prefix), the rest of the
+    body is as sent, and the stats say what was left out and how often each
+    tool is called - the evidence for choosing what to drop."""
+    body1 = _tools_body(1)
+    body2 = _tools_body(2)
+
+    def tune(cfg):  # noqa: ANN001
+        cfg.claude.drop_tool_prefixes = ["mcp__Google_Drive"]
+
+    async def run(client, up, claude):  # noqa: ANN001
+        await _post(client, "/v1/messages", body1)
+        await _post(client, "/v1/messages", body2)
+        for sent, original in ((up.bodies[-2][1], body1), (up.bodies[-1][1], body2)):
+            assert [t["name"] for t in sent["tools"]] == ["Read", "Bash"], sent["tools"]
+            assert sent["messages"] == original["messages"] and sent["system"] == original["system"]
+            assert sent["metadata"] == original["metadata"]
+        assert body1["tools"][2]["name"] == "mcp__Google_Drive__search", "the caller's body was edited"
+        t = claude.stats.snapshot()["totals"]
+        assert t["tools_dropped_requests"] == 2, t
+        gone = len(json.dumps(body1["tools"][2], separators=(",", ":"))) + len(json.dumps(body1["tools"][3], separators=(",", ":")))
+        assert t["tools_dropped_chars"] == 2 * gone, (t["tools_dropped_chars"], gone)
+        assert t["saved_tools_usd_est"] > 0 and abs(t["saved_usd_est"] - t["saved_tools_usd_est"]) < 1e-12, t
+        usage = claude.stats.snapshot()["tool_usage"]
+        # Every tool counted as sent on every request, before any were left out.
+        assert all(usage[n]["sent"] == 2 for n in ("Read", "Bash", "mcp__Google_Drive__search")), usage
+        assert usage["mcp__Google_Drive__search"]["chars"] > 2000 and usage["Read"]["calls"] == 0
+        # Nothing of a definition in the record: names and numbers only.
+        on_disk = Path(claude.cfg.stats_path).read_text(encoding="utf-8")
+        assert "mcp__Google_Drive__search" in on_disk and "d" * 50 not in on_disk
+
+    asyncio.run(_with_bridge(run, tune))
+
+
+def test_dry_run_counts_dropped_tools_without_dropping() -> None:
+    body = _tools_body(1)
+
+    def tune(cfg):  # noqa: ANN001
+        cfg.claude.drop_tool_prefixes = ["mcp__Google_Drive"]
+        cfg.claude.dry_run = True
+
+    async def run(client, up, claude):  # noqa: ANN001
+        await _post(client, "/v1/messages", body)
+        assert up.bodies[-1][1] == body, "dry-run changed the body"
+        ev = claude.stats.snapshot()["recent"][0]
+        assert any(n.startswith("left out 2 tool definition") for n in ev["notes"]), ev["notes"]
+        assert "dry-run: body forwarded unchanged" in ev["notes"]
+
+    asyncio.run(_with_bridge(run, tune))
+
+
+def test_tool_calls_are_read_from_the_reply() -> None:
+    stream = _sse("claude-opus-5-5", read=10, write_1h=0, out=5)
+    stream += (b'event: content_block_start\ndata: {"type":"content_block_start","index":1,'
+               b'"content_block":{"type":"tool_use","id":"t1","name":"Bash","input":{}}}\n\n')
+    assert parse_sse(stream).tools_called == ["Bash"]
+    flat = json.dumps({"model": "claude-opus-5-5", "stop_reason": "tool_use", "usage": {"input_tokens": 3, "output_tokens": 9},
+                       "content": [{"type": "text", "text": "hi"}, {"type": "tool_use", "id": "x", "name": "Edit", "input": {}}]})
+    assert parse_json(flat.encode()).tools_called == ["Edit"]
+    u = parse_sse(_sse("claude-opus-5-5", read=40_000, write_1h=1_000, out=50))
+    assert u.write_ttl == "1h"
+
+
+def test_keep_warm_refreshes_a_one_hour_entry_only() -> None:
+    """After two real requests on a conversation whose cache entry is 1-hour,
+    the proxy replays the last request with max_tokens 0 and stream off, books
+    it as a keep-alive, and re-plans up to keep_warm_limit times. A 5-minute
+    entry gets no refresh at all."""
+    body1 = _claude_code_body(1)
+    body2 = _claude_code_body(2)
+
+    def tune(cfg):  # noqa: ANN001
+        cfg.claude.keep_cache_warm = True
+        cfg.claude.keep_warm_after_seconds = 1   # the real floor is 60; this is a test
+        cfg.claude.keep_warm_limit = 2
+        cfg.claude.keep_warm_min_requests = 2
+
+    async def run(client, up, claude):  # noqa: ANN001
+        await _post(client, "/v1/messages?beta=true", body1)
+        assert claude.warmer.planned() == 0, "planned after one request"
+        await _post(client, "/v1/messages?beta=true", body2)
+        assert claude.warmer.planned() == 1
+        for _ in range(100):
+            if len(up.bodies) >= 4:
+                break
+            await asyncio.sleep(0.1)
+        refreshes = [b for p, b in up.bodies[2:] if p == "/v1/messages?beta=true"]
+        assert len(refreshes) == 2, f"{len(refreshes)} refreshes (limit 2) in {len(up.bodies)} bodies"
+        for r in refreshes:
+            assert r["max_tokens"] == 0 and r["stream"] is False
+            assert r["messages"] == body2["messages"] and r["system"] == body2["system"]
+        await asyncio.sleep(1.5)
+        assert len(up.bodies) == 4, "refreshed past the limit"
+        assert claude.warmer.planned() == 0
+        t = claude.stats.snapshot()["totals"]
+        assert t["keep_alives"] == 2 and t["keep_alive_failures"] == 0, t
+        assert t["keep_alive_cost_usd"] > 0 and t["requests"] == 2, t
+        assert claude.stats.snapshot()["recent"][0]["kind"] == "keep-alive"
+
+    asyncio.run(_with_bridge(run, tune))
+
+    # A 5-minute entry: no plan, however many requests.
+    stats = ClaudeStats(None)
+    cfg = _config(Path(".")).claude
+    cfg.keep_cache_warm = True
+    posted = []
+    warmer = KeepWarm(cfg, stats, post=lambda *a: posted.append(a) or (200, "application/json", b"{}"))
+    assert not warmer.plan("c", "http://x/v1/messages", {}, b"{}", ttl="5m", started_at=time.time())
+    assert not warmer.plan("c", "http://x/v1/messages", {}, b"{}", ttl="", started_at=time.time())
+    cfg.keep_cache_warm = False
+    assert not warmer.plan("c", "http://x/v1/messages", {}, b"{}", ttl="1h", started_at=time.time())
+    assert warmer.planned() == 0 and not posted
+
+
+def test_keep_warm_books_the_rewrite_it_avoided() -> None:
+    """The next real request after a pause longer than the entry's hour that
+    still reads from cache: the rewrite avoided, priced at write minus read."""
+    stats = ClaudeStats(None)
+    conv = stats.conversations.setdefault("c", ConvState())
+    conv.write_ttl = "1h"
+    conv.requests = 2
+    conv.last_prompt_tokens = 50_000
+    conv.last_real_ts = time.time() - 3700
+    conv.warmed = True
+    usage = parse_sse(_sse("claude-opus-5-5", read=50_000, write_1h=0, out=20))
+    ev = stats.record(conversation="c", path="v1/messages", status=200, streamed=True, duration_ms=1,
+                      chars_in=100, chars_out=1000, usage=usage, removed_chars_new=0, removed_chars_replayed=0,
+                      stubs_new=0, notes=[], dry_run=False)
+    t = stats.totals
+    assert t["rewrites_avoided"] == 1 and t["rewrite_tokens_avoided"] == 50_000, t
+    assert abs(t["rewrite_saved_usd_est"] - 50_000 * (8.0 - 0.20) / 1e6) < 1e-9, t["rewrite_saved_usd_est"]
+    assert any(n.startswith("kept warm: read 50,000 tokens") for n in ev.notes), ev.notes
+    assert not conv.warmed
+    # The same pause with no refresh behind it is booked as nothing.
+    conv.last_real_ts = time.time() - 3700
+    stats.record(conversation="c", path="v1/messages", status=200, streamed=True, duration_ms=1,
+                 chars_in=100, chars_out=1000, usage=usage, removed_chars_new=0, removed_chars_replayed=0,
+                 stubs_new=0, notes=[], dry_run=False)
+    assert stats.totals["rewrites_avoided"] == 1
+
+
 if __name__ == "__main__":
     test_is_messages_request()
     test_response_tap_keeps_both_ends()
@@ -288,4 +453,9 @@ if __name__ == "__main__":
     test_bridge_stubs_a_duplicate_and_replays_it()
     test_bridge_leaves_count_tokens_alone()
     test_mitm_addon_claude_flow()
+    test_bridge_leaves_out_tool_families_on_every_request()
+    test_dry_run_counts_dropped_tools_without_dropping()
+    test_tool_calls_are_read_from_the_reply()
+    test_keep_warm_refreshes_a_one_hour_entry_only()
+    test_keep_warm_books_the_rewrite_it_avoided()
     print("ok")

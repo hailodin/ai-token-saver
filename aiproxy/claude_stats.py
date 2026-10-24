@@ -59,6 +59,9 @@ class ClaudeEvent:
     error: str = ""
     notes: list[str] = field(default_factory=list)
     dry_run: bool = False
+    kind: str = "request"   # request | keep-alive
+    tools_dropped_tokens_est: int = 0
+    rewrite_tokens_avoided: int = 0
 
     @property
     def prompt_tokens(self) -> int:
@@ -73,6 +76,15 @@ class ConvState:
     last_ts: float = 0.0
     # "5m" or "1h": the cache lifetime this conversation's writes used last.
     write_ttl: str = ""
+    # When the last REAL request was, and whether a keep-alive has refreshed
+    # the cache since: together they say whether the next real request found
+    # the cache alive only because the proxy kept it so.
+    last_real_ts: float = 0.0
+    warmed: bool = False
+
+
+def _ttl_seconds(ttl: str) -> int:
+    return 3600 if ttl == "1h" else 300
 
 
 def _write_rate(price, usage: Usage, conv: ConvState) -> float:  # noqa: ANN001
@@ -107,6 +119,24 @@ def _empty_totals() -> dict[str, Any]:
         "saved_usd_est": 0.0,
         "stubs_new": 0,
         "cache_misses": 0,
+        # saved_usd_est is the SUM of these three, each shown on its own
+        # tile so no saving is counted twice.
+        "saved_dedupe_usd_est": 0.0,
+        "saved_tools_usd_est": 0.0,
+        "rewrite_saved_usd_est": 0.0,
+        # Tool definitions left out, summed over requests: the prefix that was
+        # NOT written once per session and NOT read back every turn.
+        "tools_dropped_requests": 0,
+        "tools_dropped_chars": 0,
+        "tools_dropped_tokens_est": 0,
+        # The keep-warm: refreshes sent and what they cost, and the real
+        # requests that came back after a pause longer than the entry's life
+        # and still read from cache because a refresh had kept it.
+        "keep_alives": 0,
+        "keep_alive_cost_usd": 0.0,
+        "keep_alive_failures": 0,
+        "rewrites_avoided": 0,
+        "rewrite_tokens_avoided": 0,
     }
 
 
@@ -114,6 +144,10 @@ class ClaudeStats:
     def __init__(self, persist_path: str | Path | None = None, history_limit: int = 500):
         self._lock = threading.Lock()
         self.persist_path = Path(persist_path).expanduser().resolve() if persist_path else None
+        # Per tool NAME: how often its definition was sent, how big it is,
+        # how often the model called it. The evidence for drop_tool_prefixes;
+        # nothing of a definition's text is kept.
+        self.tool_usage: dict[str, dict[str, Any]] = {}
         self.first_started_at = time.time()
         self.started_at = time.time()
         self.totals = _empty_totals()
@@ -146,10 +180,14 @@ class ClaudeStats:
         stubs_new: int,
         notes: list[str],
         dry_run: bool,
+        tools_dropped: int = 0,
+        tools_dropped_chars: int = 0,
+        tools_sent: list[tuple[str, int]] | None = None,
     ) -> ClaudeEvent:
         with self._lock:
             conv = self.conversations.setdefault(conversation, ConvState())
             prompt = usage.prompt_tokens
+            notes = list(notes)
 
             # Measure chars/token on this response; fall back to the last
             # measurement for this conversation, then the default.
@@ -169,17 +207,42 @@ class ClaudeStats:
             removed_chars = removed_chars_new + removed_chars_replayed
             removed_tokens = int(round(removed_chars / cpt)) if removed_chars else 0
             price = price_for(usage.model)
-            saved: float | None = None
-            if price is not None:
+            write = _write_rate(price, usage, conv) if price is not None else 0.0
+            saved_dedupe: float | None = None
+            if price is not None and usage.found:
                 # New stubs: the duplicate would have been written to cache
                 # this turn. Replayed stubs: it would have been read back from
                 # cache. Both are what the API would have billed.
                 new_tok = removed_chars_new / cpt
                 rep_tok = removed_chars_replayed / cpt
-                write = _write_rate(price, usage, conv)
-                saved = (new_tok * write + rep_tok * price.cache_read) / 1_000_000
-                if not usage.found:
-                    saved = None
+                saved_dedupe = (new_tok * write + rep_tok * price.cache_read) / 1_000_000
+            saved = saved_dedupe
+            # Tool definitions left out are part of the cached prefix: on a
+            # conversation's first request they would have been written, on
+            # every later one read back. Priced by what the response says
+            # happened to the prefix they sat in front of.
+            saved_tools: float | None = None
+            tools_dropped_tokens = int(round(tools_dropped_chars / cpt)) if tools_dropped_chars else 0
+            if tools_dropped_chars and price is not None and usage.found:
+                rate = price.cache_read if usage.cache_read > 0 else write
+                saved_tools = tools_dropped_chars / cpt * rate / 1_000_000
+                saved = (saved or 0.0) + saved_tools
+            # The keep-warm's own result: if more than the entry's lifetime
+            # passed since the last real request and this one still read its
+            # context from cache, a refresh is why, and the alternative was
+            # writing all of it again.
+            now = time.time()
+            gap = now - conv.last_real_ts if conv.last_real_ts else 0.0
+            rewrite_tokens = 0
+            rewrite_saved: float | None = None
+            if conv.warmed and gap > _ttl_seconds(conv.write_ttl) and usage.found and usage.cache_read > 0:
+                rewrite_tokens = usage.cache_read
+                if price is not None:
+                    rewrite_saved = rewrite_tokens * (write - price.cache_read) / 1_000_000
+                    saved = (saved or 0.0) + rewrite_saved
+                notes.append(f"kept warm: read {rewrite_tokens:,} tokens from cache after a {int(gap // 60)}-minute pause")
+            conv.warmed = False
+            conv.last_real_ts = now
 
             cost = usage.cost_usd() if usage.found else None
             ev = ClaudeEvent(
@@ -206,8 +269,10 @@ class ClaudeStats:
                 chars_per_token=round(cpt, 2),
                 stop_reason=usage.stop_reason,
                 error=usage.error,
-                notes=list(notes),
+                notes=notes,
                 dry_run=dry_run,
+                tools_dropped_tokens_est=tools_dropped_tokens,
+                rewrite_tokens_avoided=rewrite_tokens,
             )
 
             t = self.totals
@@ -231,6 +296,31 @@ class ClaudeStats:
             t["stubs_new"] += stubs_new
             if cache_miss:
                 t["cache_misses"] += 1
+            if saved_dedupe:
+                t["saved_dedupe_usd_est"] += saved_dedupe
+            if saved_tools:
+                t["saved_tools_usd_est"] += saved_tools
+            if tools_dropped:
+                t["tools_dropped_requests"] += 1
+                t["tools_dropped_chars"] += tools_dropped_chars
+                t["tools_dropped_tokens_est"] += tools_dropped_tokens
+            if rewrite_tokens:
+                t["rewrites_avoided"] += 1
+                t["rewrite_tokens_avoided"] += rewrite_tokens
+                if rewrite_saved is not None:
+                    t["rewrite_saved_usd_est"] += rewrite_saved
+            # Every tool counted as sent on every request; each call counted
+            # once, from the reply that made it.
+            for name, chars in tools_sent or []:
+                row = self.tool_usage.setdefault(name, {"sent": 0, "chars": 0, "calls": 0,
+                                                        "last_called": 0.0, "first_sent": ev.ts})
+                row["sent"] += 1
+                row["chars"] = chars
+            for name in usage.tools_called:
+                row = self.tool_usage.setdefault(name, {"sent": 0, "chars": 0, "calls": 0,
+                                                        "last_called": 0.0, "first_sent": ev.ts})
+                row["calls"] += 1
+                row["last_called"] = ev.ts
 
             m = self.by_model.setdefault(
                 ev.model,
@@ -264,6 +354,53 @@ class ClaudeStats:
             self._persist_unlocked()
             return ev
 
+    def record_keep_alive(self, *, conversation: str, usage: Usage, status: int,
+                          duration_ms: int) -> ClaudeEvent:
+        """A refresh the proxy sent itself: spend, counted apart, and the fact
+        that the conversation's entry is now kept."""
+        with self._lock:
+            cost = usage.cost_usd() if usage.found else None
+            failed = status != 200 or bool(usage.error)
+            ev = ClaudeEvent(
+                ts=time.time(), conversation=conversation, model=usage.model or "unknown",
+                path="keep-alive", status=status, streamed=False, duration_ms=duration_ms,
+                chars_in=0, chars_out=0, input_tokens=usage.input_tokens, cache_read=usage.cache_read,
+                cache_write_5m=usage.cache_write_5m, cache_write_1h=usage.cache_write_1h,
+                output_tokens=usage.output_tokens, cost_usd=cost, removed_chars_new=0,
+                removed_chars_replayed=0, removed_tokens_est=0, saved_usd_est=None, cache_miss=False,
+                chars_per_token=0.0, stop_reason=usage.stop_reason, error=usage.error,
+                notes=["keep-alive: the conversation's last request, replayed with no output asked for"],
+                kind="keep-alive",
+            )
+            t = self.totals
+            t["keep_alives"] += 1
+            if failed:
+                t["keep_alive_failures"] += 1
+            if cost is not None:
+                t["keep_alive_cost_usd"] += cost
+                t["cost_usd"] += cost
+                m = self.by_model.setdefault(ev.model, {
+                    "requests": 0, "input_tokens": 0, "cache_read": 0, "cache_write": 0,
+                    "output_tokens": 0, "cost_usd": 0.0, "saved_usd_est": 0.0, "priced": True})
+                m["cost_usd"] += cost
+                m["cache_read"] += usage.cache_read
+            t["cache_read"] += usage.cache_read
+            if not failed:
+                conv = self.conversations.setdefault(conversation, ConvState())
+                conv.warmed = True
+                if usage.write_ttl:
+                    conv.write_ttl = usage.write_ttl
+            self.recent.appendleft(ev)
+            self._persist_unlocked()
+            return ev
+
+    def count_keep_alive_failure(self) -> None:
+        """A refresh that never got an answer (connection error): no event,
+        just the count, under the lock like every other total."""
+        with self._lock:
+            self.totals["keep_alive_failures"] += 1
+            self._persist_unlocked()
+
     # -- reading -------------------------------------------------------------
 
     def snapshot(self) -> dict[str, Any]:
@@ -281,6 +418,7 @@ class ClaudeStats:
                 "prompt_tokens": prompt_total,
                 "cache_hit_pct": round(hit, 1),
                 "by_model": self.by_model,
+                "tool_usage": {k: dict(v) for k, v in self.tool_usage.items()},
                 "recent": recent,
                 "conversations": [
                     {
@@ -299,6 +437,7 @@ class ClaudeStats:
         with self._lock:
             self.totals = _empty_totals()
             self.by_model.clear()
+            self.tool_usage.clear()
             self.recent.clear()
             self.conversations.clear()
             self.first_started_at = self.started_at = time.time()
@@ -321,6 +460,7 @@ class ClaudeStats:
                 "first_started_at": self.first_started_at,
                 "totals": self.totals,
                 "by_model": self.by_model,
+                "tool_usage": self.tool_usage,
                 "recent": [asdict(e) for e in list(self.recent)[:_RECENT_PERSIST]],
                 "conversations": {k: asdict(v) for k, v in self.conversations.items()},
             }
@@ -345,6 +485,9 @@ class ClaudeStats:
             for k, v in (data.get("by_model") or {}).items():
                 if isinstance(v, dict):
                     self.by_model[str(k)] = v
+            for k, v in (data.get("tool_usage") or {}).items():
+                if isinstance(v, dict):
+                    self.tool_usage[str(k)] = v
             restored = []
             for item in data.get("recent") or []:
                 try:

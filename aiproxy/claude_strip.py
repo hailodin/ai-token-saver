@@ -67,6 +67,23 @@ class ClaudeConfig:
     # Decisions are kept this long after their last use. A Claude Code session
     # rarely lives longer than a day; the cap just keeps the file bounded.
     state_max_entries: int = 20000
+    # Tool families to leave out of EVERY request, by the start of the tool's
+    # name. Measured on one user's traffic (19-23 Oct 2026): 99 tool
+    # definitions ever sent were about a third of a median prompt, read back
+    # on every turn, and 48 of them were never called once in 21,000 requests.
+    # The set is part of the cached prefix, so the list applies to every
+    # request alike and is changed between sessions, never during one.
+    drop_tool_prefixes: list[str] = field(default_factory=list)
+    # Replay the conversation's last request, asking for no output, just
+    # before its 1-hour cache entry expires: a cache read (cents) instead of
+    # rewriting the whole context after a long break (dollars). Only for
+    # 1-hour entries, which is what Claude Code writes; refreshing a 5-minute
+    # entry was measured to buy nothing. Off by default: it is the user's own
+    # request sent again on a timer, and it is spend.
+    keep_cache_warm: bool = False
+    keep_warm_after_seconds: int = 3300   # 55 minutes; capped below 3600 by config.py
+    keep_warm_limit: int = 3              # refreshes per pause: ~3.75 hours away comes back to a read
+    keep_warm_min_requests: int = 2       # a one-shot subagent's conversation is not kept warm
 
 
 @dataclass
@@ -93,6 +110,11 @@ class ClaudeStripResult:
     stubs_new: int = 0
     stubs_replayed: int = 0
     conversation: str = ""
+    # Every tool definition the request carried, (name, chars), before any
+    # were left out. Names only: a name is not content, a definition is.
+    tools_sent: list[tuple[str, int]] = field(default_factory=list)
+    tools_dropped: int = 0
+    tools_dropped_chars: int = 0
 
 
 class DecisionState:
@@ -258,6 +280,8 @@ def strip_claude(body: Any, cfg: ClaudeConfig, state: DecisionState) -> ClaudeSt
     messages = body["messages"]
     conv = conversation_key(body)
     result = ClaudeStripResult(body=body, changed=False, conversation=conv)
+    result.tools_sent = [(str(t.get("name") or "?"), len(serialize(t)))
+                         for t in body.get("tools") or [] if isinstance(t, dict)]
     last_idx = len(messages) - 1
 
     # (message index, block index) -> stub text to apply
@@ -319,6 +343,31 @@ def strip_claude(body: Any, cfg: ClaudeConfig, state: DecisionState) -> ClaudeSt
     result.body = out
     result.changed = True
     return result
+
+
+def drop_tools(body: dict[str, Any], prefixes: list[str]) -> tuple[int, int]:
+    """Remove tool definitions whose names start with any of `prefixes`.
+
+    Applied to every request alike, so a conversation never sees its tool set
+    change: the set is part of the cached prefix and of what later thinking
+    blocks are bound to. Change the list between sessions, not during one.
+    Returns (tools dropped, chars dropped). The body is edited in place:
+    callers pass a copy when the original must survive.
+    """
+    tools = body.get("tools")
+    if not prefixes or not isinstance(tools, list):
+        return 0, 0
+    kept, dropped, chars = [], 0, 0
+    for tool in tools:
+        name = str(tool.get("name") or "") if isinstance(tool, dict) else ""
+        if name and any(name.startswith(p) for p in prefixes):
+            dropped += 1
+            chars += len(serialize(tool))
+        else:
+            kept.append(tool)
+    if dropped:
+        body["tools"] = kept
+    return dropped, chars
 
 
 def serialize(body: Any) -> bytes:

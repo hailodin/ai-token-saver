@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 # USD per million tokens. Cache reads are 0.1x of input on most models, 0.05x on
@@ -75,6 +75,19 @@ class Usage:
     found: bool = False
     # True once a 5m/1h breakdown has been read (see _absorb_usage).
     split_seen: bool = False
+    # The tools this reply called, read from the reply itself. Counting them
+    # from the NEXT request's history would miss every call that ends the
+    # turn, because no next request follows it.
+    tools_called: list[str] = field(default_factory=list)
+
+    @property
+    def write_ttl(self) -> str:
+        """'1h' or '5m' when this response wrote to the cache, else ''."""
+        if self.cache_write_1h and not self.cache_write_5m:
+            return "1h"
+        if self.cache_write_5m:
+            return "5m"
+        return ""
 
     @property
     def prompt_tokens(self) -> int:
@@ -142,6 +155,10 @@ def parse_sse(data: bytes) -> Usage:
             delta = ev.get("delta") or {}
             if isinstance(delta, dict) and delta.get("stop_reason"):
                 u.stop_reason = str(delta["stop_reason"])
+        elif t == "content_block_start":
+            block = ev.get("content_block")
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                u.tools_called.append(str(block.get("name") or "?"))
         elif t == "error":
             err = ev.get("error") or {}
             u.error = str(err.get("message") or err.get("type") or "error")[:300]
@@ -166,6 +183,8 @@ def parse_json(data: bytes) -> Usage:
     _absorb_usage(u, obj.get("usage") or {})
     if obj.get("stop_reason"):
         u.stop_reason = str(obj["stop_reason"])
+    u.tools_called = [str(b.get("name") or "?") for b in obj.get("content") or []
+                      if isinstance(b, dict) and b.get("type") == "tool_use"]
     return u
 
 

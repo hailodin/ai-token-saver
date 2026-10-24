@@ -88,6 +88,7 @@ async def handle(request: web.Request) -> web.StreamResponse:
         # Claude Code: never the strip rules below (see claude_path.py).
         raw = body
         body, prep = claude.prepare(raw, dry_run=config.strip.dry_run)
+        prep.remember(url, headers, body)
         record_request(store, host, req_path, raw, body, prep, extract_model(raw, None))
     elif to_anthropic:
         # count_tokens and the rest: forwarded as sent. Stripping a

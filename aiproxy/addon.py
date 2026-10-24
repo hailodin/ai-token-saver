@@ -236,6 +236,7 @@ class CursorStripAddon:
                 flow.request.headers["content-length"] = str(len(sent))
                 if "transfer-encoding" in flow.request.headers:
                     del flow.request.headers["transfer-encoding"]
+            prep.remember(flow.request.url, flow.request.headers, sent)
             record_request(self.store, host, path, raw, sent, prep, extract_model(raw))
             flow.metadata[_CLAUDE_META] = (prep, ResponseTap())
             return

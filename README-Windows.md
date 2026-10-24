@@ -181,11 +181,16 @@ An `env` entry in `settings.json` wins over a shell variable. To bypass the prox
 **What the proxy does with Claude Code traffic.** Anthropic `/v1/messages` requests do not go through the generic strip rules in `config.yaml` → `strip` at all. Those rules edit earlier messages and the system prompt, which breaks Claude Code's prompt cache and its thinking blocks (the API answers 400) and costs more than it saves. Instead the proxy:
 
 - never touches `system`, `tools`, `metadata`, `cache_control`, thinking blocks, assistant turns or any earlier message;
-- makes one lossless edit to the **newest** user message only: a `tool_result` byte-identical to one already in the conversation becomes a short stub pointing at the earlier copy, and that decision is replayed identically on every later request (`logs\claude_state.json`);
+- makes one lossless edit to the **newest** user message only: a `tool_result` byte-identical to one already in the conversation becomes a short stub pointing at the earlier copy, and that decision is replayed identically on every later request (`logs\claude_state.json`). This keeps the request correct; it is not where the saving is. Measured on one user's traffic (15,728 requests over five days, October 2026) it removed 7 duplicates and saved $0.11;
 - forwards `count_tokens` untouched;
-- prices from the response's `usage` (input, cache read, 5m/1h cache write, output) and shows the result as the **Claude Code** row on the dashboard; the saving figure there is an estimate, labelled as such.
+- prices from the response's `usage` (input, cache read, 5m/1h cache write, output) and shows the result as the **Claude Code** row on the dashboard; every saving figure there is an estimate, labelled as such.
 
-Settings are under `claude:` in `config.yaml` (`enabled: false` forwards untouched and still measures). Background and reasoning: [CLAUDE-CODE-NOTES.md](CLAUDE-CODE-NOTES.md).
+**The two levers that save money** are off until you switch them on, under `claude:` in `config.yaml`:
+
+- **`drop_tool_prefixes`** leaves whole tool families out of every request, by the start of the tool's name. Claude Code describes every tool to the model on every request, and those descriptions sit in the cached prefix that is read back every turn. Measured on the same traffic, 99 tool definitions were about a third of a median prompt and 48 of them were never called once in 21,000 requests. The dashboard's **Tools sent on every turn** table lists each tool with its size and how often it has been called, so you can choose. Change the list between Claude Code sessions, never during one: a changed tool set mid-conversation is a cache miss.
+- **`keep_cache_warm`** keeps a conversation's cache alive across a long break. Claude Code writes 1-hour cache entries; come back after longer and the next message rewrites the whole context at the write rate (about $2 for a 250k-token conversation on Opus 5.5). Switched on, the proxy replays your own last request at 55 minutes with no output asked for, a cache read of a few cents that resets the entry's timer, up to three times. Only 1-hour entries are refreshed: on the measured traffic, refreshing 5-minute entries bought nothing. The replayed request is held in memory with its headers and written nowhere. It is your own request sent again on a timer, and it is spend, which is why it is your decision.
+
+`enabled: false` forwards Claude Code untouched and still measures. Background and reasoning: [CLAUDE-CODE-NOTES.md](CLAUDE-CODE-NOTES.md).
 
 **What this covers.** The `claude` CLI, and any app that lets you set an Anthropic or OpenAI base URL. **Not** the Claude desktop app: its chat talks to claude.ai, and its Code tab ignores `ANTHROPIC_BASE_URL` (checked 5–6 October 2026).
 

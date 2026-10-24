@@ -73,6 +73,57 @@ bypasses them, so the first three items below can no longer happen to it.
   remove the one thing it can remove losslessly. A context-window saver (old
   tool results) belongs server-side, and the platform docs say it is a window
   tool, not a savings lever.
+- **The dedupe is correctness, not the saving.** Measured on one user's
+  traffic (15,728 real requests, 19-23 October 2026, $2,068 at list prices):
+  7 new stubs, $0.11 saved over the proxy's lifetime. Keep it, because it is
+  lossless and it is replayed exactly; do not describe it as what the proxy
+  saves.
+
+## What saves money (measured on one user's traffic, October 2026)
+
+Two levers, both under `claude:` in `config.yaml`, both off by default, both
+applied to every request alike so the cached prefix is never disturbed
+mid-conversation.
+
+- **Tool definitions left out** (`drop_tool_prefixes`). Claude Code sends
+  every tool's definition on every request, and the set sits in the cached
+  prefix: written once per session, read back every turn. On the measured
+  traffic 99 definitions came to 225,000 chars, about 78,000 tokens at the
+  measured 2.87 chars per token - a third of a median Opus 5.5 prompt of
+  234,000 tokens - and 48 of them were never called once in 21,260 requests
+  (Artifact alone 37,000 chars). The cache reads of those unused definitions
+  were about 7% of the spend. `claude_path.prepare` removes the named families
+  from every request (`claude_strip.drop_tools`); `claude_stats` books the
+  saving at the read rate when the response read from cache and at the
+  response's write rate when it wrote, and keeps a `tool_usage` table (name,
+  size, times sent, times called, from the reply's own `tool_use` blocks) that
+  the dashboard shows so the user can choose. The list is changed between
+  sessions, never during one.
+- **The keep-warm, 1-hour plan only** (`keep_cache_warm`). Claude Code writes
+  1-hour cache entries. On the measured traffic, four pauses of one to four
+  hours with no refresh were full rewrites (about $20 together); three with
+  one refresh came back writing a median 873 tokens, a normal turn. A refresh
+  at 55 minutes is the conversation's own last request with `max_tokens: 0`
+  and `stream: false`: the API runs prefill, resets the entry's timer and
+  bills a cache read. Up to `keep_warm_limit` (3) refreshes a pause, only
+  once the conversation has made `keep_warm_min_requests` (2) real requests,
+  so a one-shot subagent's conversation is not kept. The 5-minute plan the
+  Longship gateway also had was measured and dropped: 1,052 of its 1,125
+  refreshes were 5-minute ones, and a pause of 5 minutes to an hour with none
+  came back to a cache read anyway. The replayed request is held in memory
+  with its headers (`claude_path.KeepWarm`) and is never written. Booked on
+  the dashboard as refreshes sent and what they cost, and as rewrites avoided:
+  a real request after a pause longer than the entry's hour that still read
+  from cache, priced at write minus read.
+- **Not ported: the effort cap.** Longship's gateway can lower
+  `output_config.effort`. On the measured traffic the user raised effort to
+  max on 2,455 requests and lowered it on none, and output per turn at max
+  was no larger than as asked. It saves only by trading quality; it is not a
+  lever this proxy offers.
+- **What no proxy can avoid.** 89% of Opus 5.5 cache writes (69% on Fable
+  5.1) were ordinary new content per turn. The largest thing entering a
+  conversation is command output (30.7M chars over the lifetime), then file
+  reads (17.5M). Those are the user's to shorten.
 
 ## Pricing used (USD per million tokens, list)
 

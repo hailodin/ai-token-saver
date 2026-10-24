@@ -119,6 +119,36 @@ claude:
   dedupe_min_chars: 300      # a pointer is ~150 chars; smaller results are left alone
   state_path: "logs/claude_state.json"   # every pointer ever sent, replayed identically
   stats_path: "logs/claude_stats.json"
+  # The two levers that measurably reduce what Claude Code is billed. Both are
+  # off until you choose; both apply to every request alike.
+  #
+  # Tool definitions are sent on every request and are a large part of the
+  # cached prefix: measured on one user's traffic (19-23 Oct 2026), 99 tool
+  # definitions were about a third of a median prompt, and 48 of them were
+  # never called once in 21,000 requests. The dashboard's "Tools sent on every
+  # turn" table shows each tool's size and how often it is called. Name a
+  # family here by the START of its name and it is left out of every request.
+  # Change this between Claude Code sessions, never during one: the tool set
+  # is part of the cached prefix, and a change to it mid-conversation is a
+  # cache miss (the whole context written again).
+  drop_tool_prefixes: []
+  #   - "mcp__claude_ai_Google_Drive"   # claude.ai connectors the CLI loads into every session
+  #   - "mcp__claude_ai_Claude_Docs"
+  #   - "Artifact"                      # Artifact, ArtifactData, ArtifactComments
+  #
+  # Claude Code writes 1-HOUR cache entries. Come back after a longer break and
+  # the next message rewrites the whole context at the write rate (~$2 for a
+  # 250k conversation on Opus 5.5). With keep_cache_warm on, the proxy replays
+  # your own last request at 55 minutes with no output asked for: a cache read
+  # (~5 cents) that resets the entry's timer, up to keep_warm_limit times, so a
+  # break of up to about 3.75 hours comes back to a read. Only 1-hour entries:
+  # refreshing 5-minute entries was measured to buy nothing. The last request
+  # is held in memory with its headers and written nowhere. It is your own
+  # request sent again on a timer, and it is spend, which is why it is off.
+  keep_cache_warm: false
+  keep_warm_after_seconds: 3300   # 60..3540
+  keep_warm_limit: 3              # refreshes per pause, then the entry is let go
+  keep_warm_min_requests: 2       # a conversation with fewer real requests (a one-shot subagent) is not kept warm
 
 logging:
   level: INFO
